@@ -55,6 +55,7 @@ else:
 
 import vertica_python
 from .. import errors
+from ..socket_stream import SocketStream
 from ..vertica import messages
 from ..vertica.cursor import Cursor
 from ..vertica.messages.message import BackendMessage, FrontendMessage
@@ -248,7 +249,8 @@ class Connection(object):
         self.backend_pid = None
         self.backend_key = None
         self.transaction_status = None
-        self.socket = None
+        self.socket = None  # Kept for compability, unused here
+        self.socket_stream = None
 
         options = options or {}
         self.options = parse_dsn(options['dsn']) if 'dsn' in options else {}
@@ -386,14 +388,13 @@ class Connection(object):
             raise errors.ConnectionError('Connection is closed')
         self._logger.info('Canceling the current database operation')
         # Must create a new socket connection to the server
-        temp_socket = self.establish_socket_connection(self.address_list)
-        self.write(CancelRequest(self.backend_pid, self.backend_key), temp_socket)
-        temp_socket.close()
+        with self.establish_socket_connection(self.address_list) as temp_socket:
+            self.write(CancelRequest(self.backend_pid, self.backend_key), temp_socket)
 
         self._logger.info('Cancel request issued')
 
     def opened(self):
-        return (self.socket is not None
+        return (self.socket_stream is not None
                 and self.backend_pid is not None
                 and self.transaction_status is not None)
 
@@ -405,8 +406,8 @@ class Connection(object):
 
         s1 = "<Vertica.Connection:{0} parameters={1} backend_pid={2}, ".format(
             id(self), self.parameters, self.backend_pid)
-        s2 = "backend_key={0}, transaction_status={1}, socket={2}, options={3}>".format(
-            self.backend_key, self.transaction_status, self.socket, safe_options)
+        s2 = "backend_key={0}, transaction_status={1}, socket_stream={2}, options={3}>".format(
+            self.backend_key, self.transaction_status, self.socket_stream, safe_options)
         return ''.join([s1, s2])
 
     #############################################
@@ -419,31 +420,33 @@ class Connection(object):
         self.backend_key = None
         self.transaction_status = None
         self.socket = None
+        self.socket_stream = None
         self.address_list = _AddressList(self.options['host'], self.options['port'],
                                          self.options['backup_server_node'], self._logger)
 
-    def _socket(self):
-        if self.socket:
-            return self.socket
+    def _socket_stream(self):
+        if self.socket_stream:
+            return self.socket_stream
 
         # the initial establishment of the client connection
-        raw_socket = self.establish_socket_connection(self.address_list)
+        socket_stream = self.establish_socket_connection(self.address_list)
 
         # enable load balancing
         load_balance_options = self.options.get('connection_load_balance')
         self._logger.debug('Connection load balance option is {0}'.format(
                      'enabled' if load_balance_options else 'disabled'))
         if load_balance_options:
-            raw_socket = self.balance_load(raw_socket)
+            socket_stream = self.balance_load(socket_stream)
 
         # enable SSL
         ssl_options = self.options.get('ssl')
         self._logger.debug('SSL option is {0}'.format('enabled' if ssl_options else 'disabled'))
         if ssl_options:
-            raw_socket = self.enable_ssl(raw_socket, ssl_options)
+            socket_stream = self.enable_ssl(socket_stream, ssl_options)
 
-        self.socket = raw_socket
-        return self.socket
+        self.socket = socket_stream.socket
+        self.socket_stream = socket_stream
+        return self.socket_stream
 
     def create_socket(self, family):
         """Create a TCP socket object"""
@@ -455,46 +458,49 @@ class Connection(object):
             raw_socket.settimeout(connection_timeout)
         return raw_socket
 
-    def balance_load(self, raw_socket):
+    def create_socket_stream(self, raw_socket):
+        return SocketStream(raw_socket, self.options.get('socket_buffer_size'))
+
+    def balance_load(self, socket_stream):
         # Send load balance request and read server response
         self._logger.debug('=> %s', messages.LoadBalanceRequest())
-        raw_socket.sendall(messages.LoadBalanceRequest().get_message())
-        response = raw_socket.recv(1)
+        socket_stream.write(messages.LoadBalanceRequest().get_message())
+        response = socket_stream.read(1)
 
         if response == b'Y':
-            size = unpack('!I', raw_socket.recv(4))[0]
+            size = unpack('!I', socket_stream.read(4))[0]
             if size < 4:
                 err_msg = "Bad message size: {0}".format(size)
                 self._logger.error(err_msg)
                 raise errors.MessageError(err_msg)
-            res = BackendMessage.from_type(type_=response, data=raw_socket.recv(size - 4))
+            res = BackendMessage.from_type(type_=response, data=socket_stream.read(size - 4))
             self._logger.debug('<= %s', res)
             host = res.get_host()
             port = res.get_port()
             self._logger.info('Load balancing to host "{0}" on port {1}'.format(host, port))
 
-            peer = raw_socket.getpeername()
+            peer = socket_stream.socket.getpeername()
             socket_host, socket_port = peer[0], peer[1]
             if host == socket_host and port == socket_port:
                 self._logger.info('Already connecting to host "{0}" on port {1}. Ignore load balancing.'.format(host, port))
-                return raw_socket
+                return socket_stream
 
             # Push the new host onto the address list before connecting again. Note that this
             # will leave the originally-specified host as the first failover possibility.
             self.address_list.push(host, port)
-            raw_socket.close()
-            raw_socket = self.establish_socket_connection(self.address_list)
+            socket_stream.close()
+            socket_stream = self.establish_socket_connection(self.address_list)
         else:
             self._logger.debug('<= LoadBalanceResponse: %s', response)
             self._logger.warning("Load balancing requested but not supported by server")
 
-        return raw_socket
+        return socket_stream
 
-    def enable_ssl(self, raw_socket, ssl_options):
+    def enable_ssl(self, socket_stream, ssl_options):
         # Send SSL request and read server response
         self._logger.debug('=> %s', messages.SslRequest())
-        raw_socket.sendall(messages.SslRequest().get_message())
-        response = raw_socket.recv(1)
+        socket_stream.write(messages.SslRequest().get_message())
+        response = socket_stream.read(1)
         self._logger.debug('<= SslResponse: %s', response)
         if response == b'S':
             self._logger.info('Enabling SSL')
@@ -505,9 +511,10 @@ class Connection(object):
                         msg = 'Cannot get the connected server host while enabling SSL'
                         self._logger.error(msg)
                         raise errors.ConnectionError(msg)
-                    raw_socket = ssl_options.wrap_socket(raw_socket, server_hostname=server_host)
+                    raw_socket = ssl_options.wrap_socket(socket_stream.socket, server_hostname=server_host)
                 else:
-                    raw_socket = ssl.wrap_socket(raw_socket)
+                    raw_socket = ssl.wrap_socket(socket_stream.socket)
+                socket_stream = self.create_socket_stream(raw_socket)
             except ssl.CertificateError as e:
                 raise_from(errors.ConnectionError(str(e)), e)
             except ssl.SSLError as e:
@@ -516,7 +523,7 @@ class Connection(object):
             err_msg = "SSL requested but not supported by server"
             self._logger.error(err_msg)
             raise errors.SSLNotSupported(err_msg)
-        return raw_socket
+        return socket_stream
 
     def establish_socket_connection(self, address_list):
         """Given a list of database node addresses, establish the socket
@@ -555,24 +562,25 @@ class Connection(object):
             self._logger.error(err_msg)
             raise errors.ConnectionError(err_msg)
 
-        return raw_socket
+        return self.create_socket_stream(raw_socket)
 
     def ssl(self):
-        return self.socket is not None and isinstance(self.socket, ssl.SSLSocket)
+        return self.socket_stream is not None and self.socket_stream.is_ssl()
 
     def write(self, message, vsocket=None):
         if not isinstance(message, FrontendMessage):
             raise TypeError("invalid message: ({0})".format(message))
         if vsocket is None:
-            vsocket = self._socket()
+            vsocket = self._socket_stream()
         self._logger.debug('=> %s', message)
         try:
             for data in message.fetch_message():
                 try:
-                    vsocket.sendall(data)
+                    vsocket.write(data)
                 except Exception:
                     self._logger.error("couldn't send message")
                     raise
+            vsocket.flush()
 
         except Exception as e:
             self.close_socket()
@@ -584,8 +592,8 @@ class Connection(object):
 
     def close_socket(self):
         try:
-            if self.socket is not None:
-                self._socket().close()
+            if self.socket_stream is not None:
+                self.socket_stream.close()
         finally:
             self.reset_values()
 
@@ -684,8 +692,8 @@ class Connection(object):
             raise errors.MessageError(msg)
 
     def read_bytes(self, n):
-        if n == 1:
-            result = self._socket().recv(1)
+        if n <= 4:
+            result = self._socket_stream().read(n)
             if not result:
                 raise errors.ConnectionError("Connection closed by Vertica")
             return result
@@ -694,8 +702,8 @@ class Connection(object):
             view = memoryview(buf)
             to_read = n
             while to_read > 0:
-                received = self._socket().recv_into(view, to_read)
-                if received == 0:
+                received = self._socket_stream().readinto(view)
+                if not received:
                     raise errors.ConnectionError("Connection closed by Vertica")
                 view = view[received:]
                 to_read -= received
